@@ -1,0 +1,30 @@
+# --- Dataset (large, licensed separately - never upload) ---
+BraTS2021/
+*.tar
+*.nii
+*.nii.gz
+
+# --- Credentials (NEVER upload) ---
+kaggle.json
+.kaggle/
+*.env
+
+# --- Virtual environment ---
+venv/
+.venv/
+env/
+
+# --- Training outputs / checkpoints ---
+runs/
+*.pt
+*.pth
+
+# --- Python cache ---
+__pycache__/
+*.pyc
+
+# --- OS / editor files ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,9 @@
+# Install PyTorch separately first (CUDA 12.1 build):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+nibabel
+scikit-learn
+scipy
+numpy
+matplotlib
+tqdm
+kaggle==1.6.17
