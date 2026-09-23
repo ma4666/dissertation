@@ -1,0 +1,636 @@
+import os, glob, json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.backends.cudnn as cudnn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from scipy import ndimage
+from tqdm import tqdm
+
+cudnn.benchmark = False
+
+try:
+    import nibabel as nib
+except ImportError:
+    raise SystemExit("Missing packages. Run: pip install nibabel scikit-learn tqdm matplotlib scipy")
+
+DATA_ROOT   = "./BraTS2021"
+OUT_DIR     = "./runs/casfnet_brats_100"
+
+MAX_SUBJECTS = 100
+EPOCHS       = 15
+BATCH_SIZE   = 16
+
+MODALITIES  = ["flair", "t1", "t1ce", "t2"]
+REGIONS     = ["WT", "TC", "ET"]
+N_CLASSES   = 3
+SLICE_AXIS  = 2
+IMG_SIZE    = 96
+MIN_TUMOUR  = 50
+
+VAL_FRAC    = 0.15
+TEST_FRAC   = 0.15
+SEED        = 42
+
+IN_CH       = 4
+BASE_CH     = 40
+DROPOUT_P   = 0.2
+
+LR          = 3e-4
+WD          = 1e-5
+MC_SAMPLES  = 10
+
+CACHE_SIZE  = 20
+MIN_COMPONENT_SIZE = 30
+
+DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
+USE_AMP  = False
+WORKERS  = 2
+print(f"Device: {DEVICE} | AMP: {USE_AMP} | workers: {WORKERS}")
+
+
+def make_scaler():
+    try:
+        return torch.amp.GradScaler(DEVICE, enabled=USE_AMP)
+    except Exception:
+        try:
+            return torch.cuda.amp.GradScaler(enabled=USE_AMP)
+        except Exception:
+            return torch.amp.GradScaler(enabled=USE_AMP)
+
+
+def autocast_ctx():
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    return torch.autocast(dev, enabled=USE_AMP)
+
+
+def resolve_data_root(root):
+    if glob.glob(os.path.join(root, "*", "*_flair.nii.gz")):
+        return root
+    deep = glob.glob(os.path.join(root, "**", "*_flair.nii.gz"), recursive=True)
+    if deep:
+        return os.path.dirname(os.path.dirname(deep[0]))
+    raise FileNotFoundError(f"Could not find any *_flair.nii.gz under {root}.")
+
+
+def list_subjects(root):
+    root = resolve_data_root(root)
+    subs = []
+    for d in sorted(glob.glob(os.path.join(root, "*"))):
+        if os.path.isdir(d) and glob.glob(os.path.join(d, "*_flair.nii.gz")) and glob.glob(os.path.join(d, "*_seg.nii.gz")):
+            subs.append(d)
+    if not subs:
+        raise FileNotFoundError(f"Found no subject folders under {root}.")
+    if MAX_SUBJECTS:
+        subs = subs[:MAX_SUBJECTS]
+    print(f"Using {len(subs)} subjects from {root}")
+    return subs
+
+
+def split_subjects(subs):
+    tr, rest = train_test_split(subs, test_size=VAL_FRAC + TEST_FRAC, random_state=SEED)
+    rel = TEST_FRAC / (VAL_FRAC + TEST_FRAC)
+    va, te = train_test_split(rest, test_size=rel, random_state=SEED)
+    return tr, va, te
+
+
+def zscore_nonzero(vol):
+    mask = vol > 0
+    if mask.sum() == 0:
+        return vol.astype(np.float32)
+    m, s = vol[mask].mean(), vol[mask].std() + 1e-8
+    out = (vol - m) / s
+    out[~mask] = 0.0
+    return out.astype(np.float32)
+
+
+def labels_to_regions(seg):
+    wt = ((seg == 1) | (seg == 2) | (seg == 4)).astype(np.float32)
+    tc = ((seg == 1) | (seg == 4)).astype(np.float32)
+    et = (seg == 4).astype(np.float32)
+    return np.stack([wt, tc, et], axis=0)
+
+
+def center_crop_or_pad(arr, size):
+    h, w = arr.shape[-2:]
+    ph, pw = max(size - h, 0), max(size - w, 0)
+    arr = np.pad(arr, [(0, 0)] * (arr.ndim - 2) + [(ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2)], mode="constant")
+    h, w = arr.shape[-2:]
+    top, left = (h - size) // 2, (w - size) // 2
+    return arr[..., top:top + size, left:left + size]
+
+
+class BraTSSliceDataset(Dataset):
+    def __init__(self, subjects, train=True, cache_size=CACHE_SIZE):
+        self.subjects, self.train, self.cache_size = subjects, train, cache_size
+        self._cache, self._order = {}, []
+        self.index = []
+        for sp in tqdm(subjects, desc="indexing", leave=False):
+            seg = self._load_seg(sp)
+            for z in range(seg.shape[SLICE_AXIS]):
+                sl = np.take(seg, z, axis=SLICE_AXIS)
+                if (not train) or (sl > 0).sum() >= MIN_TUMOUR:
+                    self.index.append((sp, z))
+        self._cache.clear(); self._order.clear()
+
+    def _find(self, sp, key):
+        hits = glob.glob(os.path.join(sp, f"*_{key}.nii.gz"))
+        if not hits:
+            raise FileNotFoundError(f"No *_{key}.nii.gz in {sp}")
+        return hits[0]
+
+    def _load_seg(self, sp):
+        return nib.load(self._find(sp, "seg")).get_fdata().astype(np.int16)
+
+    def _load_subject(self, sp):
+        if sp in self._cache:
+            return self._cache[sp]
+        mods = np.stack(
+            [zscore_nonzero(nib.load(self._find(sp, m)).get_fdata().astype(np.float32))
+             for m in MODALITIES], axis=0)
+        seg = self._load_seg(sp)
+        self._cache[sp] = (mods, seg); self._order.append(sp)
+        if len(self._order) > self.cache_size:
+            self._cache.pop(self._order.pop(0), None)
+        return mods, seg
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, i):
+        sp, z = self.index[i]
+        mods, seg = self._load_subject(sp)
+        img = np.take(mods, z, axis=SLICE_AXIS + 1)
+        lab = np.take(seg, z, axis=SLICE_AXIS)
+        img = center_crop_or_pad(img, IMG_SIZE)
+        lab = center_crop_or_pad(lab, IMG_SIZE)
+        target = labels_to_regions(lab)
+        if self.train:
+            img, target = self._augment(img, target)
+        return torch.from_numpy(img.copy()).float(), torch.from_numpy(target.copy()).float()
+
+    def _augment(self, img, target):
+        if np.random.rand() < 0.5: img = img[..., ::-1]; target = target[..., ::-1]
+        if np.random.rand() < 0.5: img = img[..., ::-1, :]; target = target[..., ::-1, :]
+        k = np.random.randint(4)
+        if k:
+            img = np.rot90(img, k, axes=(-2, -1)); target = np.rot90(target, k, axes=(-2, -1))
+        return img, target
+
+
+def build_datasets():
+    tr, va, te = split_subjects(list_subjects(DATA_ROOT))
+    return (BraTSSliceDataset(tr, True, cache_size=CACHE_SIZE),
+            BraTSSliceDataset(va, False, cache_size=CACHE_SIZE),
+            BraTSSliceDataset(te, False, cache_size=CACHE_SIZE))
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, cin, cout, p=0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(cin, cout, 3, padding=1, bias=False), nn.BatchNorm2d(cout), nn.GELU(),
+            nn.Dropout2d(p),
+            nn.Conv2d(cout, cout, 3, padding=1, bias=False), nn.BatchNorm2d(cout), nn.GELU())
+    def forward(self, x): return self.net(x)
+
+
+class Down(nn.Module):
+    def __init__(self, cin, cout, p=0.0):
+        super().__init__(); self.pool = nn.MaxPool2d(2); self.conv = ConvBlock(cin, cout, p)
+    def forward(self, x): return self.conv(self.pool(x))
+
+
+class Up(nn.Module):
+    def __init__(self, cin, skip, cout, p=0.0):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(cin, cin // 2, 2, stride=2)
+        self.conv = ConvBlock(cin // 2 + skip, cout, p)
+    def forward(self, x, s):
+        x = self.up(x)
+        dy, dx = s.size(-2) - x.size(-2), s.size(-1) - x.size(-1)
+        x = F.pad(x, [dx // 2, dx - dx // 2, dy // 2, dy - dy // 2])
+        return self.conv(torch.cat([s, x], dim=1))
+
+
+class PatchEmbed(nn.Module):
+    def __init__(self, cin, dim, patch=1):
+        super().__init__(); self.proj = nn.Conv2d(cin, dim, patch, stride=patch)
+    def forward(self, x):
+        x = self.proj(x); B, C, H, W = x.shape
+        return x.flatten(2).transpose(1, 2), (H, W)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, heads=4, mlp_ratio=2.0, p=0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=p, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(nn.Linear(dim, int(dim * mlp_ratio)), nn.GELU(), nn.Dropout(p), nn.Linear(int(dim * mlp_ratio), dim))
+    def forward(self, x):
+        h = self.norm1(x)
+        x = x + self.attn(h, h, h, need_weights=False)[0]
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class CrossAttentionFusion(nn.Module):
+    def __init__(self, dim, heads=4, p=0.0):
+        super().__init__()
+        self.a_c2t = nn.MultiheadAttention(dim, heads, dropout=p, batch_first=True)
+        self.a_t2c = nn.MultiheadAttention(dim, heads, dropout=p, batch_first=True)
+        self.nc, self.nt = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.proj = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(), nn.Dropout(p))
+    def forward(self, cnn_tok, trf_tok):
+        c, t = self.nc(cnn_tok), self.nt(trf_tok)
+        c2t = self.a_c2t(c, t, t, need_weights=False)[0]
+        t2c = self.a_t2c(t, c, c, need_weights=False)[0]
+        return self.proj(torch.cat([cnn_tok + c2t, trf_tok + t2c], dim=-1))
+
+
+class CrossScaleFusion(nn.Module):
+    def __init__(self, chans, out_ch, p=0.0):
+        super().__init__()
+        self.reduce = nn.ModuleList([nn.Conv2d(c, out_ch, 1) for c in chans])
+        self.fuse = ConvBlock(out_ch * len(chans), out_ch, p)
+    def forward(self, feats, ref):
+        al = []
+        for f, r in zip(feats, self.reduce):
+            f = r(f)
+            if f.shape[-2:] != ref:
+                f = F.interpolate(f, size=ref, mode="bilinear", align_corners=False)
+            al.append(f)
+        return self.fuse(torch.cat(al, dim=1))
+
+
+class CASFNet(nn.Module):
+    def __init__(self, in_ch=IN_CH, n_classes=N_CLASSES, base=BASE_CH, p=DROPOUT_P, trf_layers=2, heads=4):
+        super().__init__()
+        c1, c2, c3, c4 = base, base * 2, base * 4, base * 8
+        self.inc = ConvBlock(in_ch, c1, p)
+        self.d1, self.d2, self.d3 = Down(c1, c2, p), Down(c2, c3, p), Down(c3, c4, p)
+        self.embed = PatchEmbed(c4, c4, 1)
+        n_tokens = (IMG_SIZE // 8) ** 2
+        self.pos = nn.Parameter(torch.zeros(1, n_tokens, c4))
+        nn.init.trunc_normal_(self.pos, std=0.02)
+        self.trf = nn.ModuleList([TransformerBlock(c4, heads, p=p) for _ in range(trf_layers)])
+        self.caf = CrossAttentionFusion(c4, heads, p)
+        self.bdrop = nn.Dropout2d(p)
+        self.u3, self.u2, self.u1 = Up(c4, c3, c3, p), Up(c3, c2, c2, p), Up(c2, c1, c1, p)
+        self.csf = CrossScaleFusion([c3, c2, c1], c1, p)
+        self.head = nn.Conv2d(c1, n_classes, 1)
+    def forward(self, x):
+        x1 = self.inc(x); x2 = self.d1(x1); x3 = self.d2(x2); x4 = self.d3(x3)
+        B, C, H, W = x4.shape
+        tok, _ = self.embed(x4); tok = tok + self.pos
+        for blk in self.trf: tok = blk(tok)
+        cnn_tok = x4.flatten(2).transpose(1, 2)
+        x4 = self.caf(cnn_tok, tok).transpose(1, 2).reshape(B, C, H, W)
+        x4 = self.bdrop(x4)
+        d3 = self.u3(x4, x3); d2 = self.u2(d3, x2); d1 = self.u1(d2, x1)
+        return self.head(self.csf([d3, d2, d1], d1.shape[-2:]))
+
+
+def soft_dice_loss(logits, targets, eps=1e-6):
+    p = torch.sigmoid(logits); dims = (0, 2, 3)
+    inter = (p * targets).sum(dims); denom = p.sum(dims) + targets.sum(dims)
+    return 1.0 - ((2 * inter + eps) / (denom + eps)).mean()
+
+
+def focal_loss(logits, targets, gamma=2.0, alpha=0.25):
+    p = torch.sigmoid(logits)
+    ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    p_t = p * targets + (1 - p) * (1 - targets)
+    alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+    loss = alpha_t * (1 - p_t).pow(gamma) * ce
+    return loss.mean()
+
+
+class DiceFocalLoss(nn.Module):
+    def __init__(self, w=0.5):
+        super().__init__(); self.w = w
+    def forward(self, logits, t):
+        return self.w * focal_loss(logits, t) + (1 - self.w) * soft_dice_loss(logits, t)
+
+
+class MetricAccumulator:
+    def __init__(self, names):
+        self.names = names; self.reset()
+    def reset(self):
+        n = len(self.names)
+        self.tp = torch.zeros(n); self.fp = torch.zeros(n); self.fn = torch.zeros(n)
+    def update(self, logits_or_probs, target, thr=0.5, is_prob=False):
+        with torch.no_grad():
+            p = logits_or_probs if is_prob else torch.sigmoid(logits_or_probs)
+            if np.isscalar(thr):
+                pred = (p > thr).float()
+            else:
+                pred = torch.stack([(p[:, c] > thr[c]).float() for c in range(p.shape[1])], dim=1)
+            dims = (0, 2, 3)
+            self.tp += (pred * target).sum(dims).cpu()
+            self.fp += (pred * (1 - target)).sum(dims).cpu()
+            self.fn += ((1 - pred) * target).sum(dims).cpu()
+    def compute(self, eps=1e-6):
+        tp, fp, fn = self.tp, self.fp, self.fn
+        dice = (2 * tp + eps) / (2 * tp + fp + fn + eps)
+        iou  = (tp + eps) / (tp + fp + fn + eps)
+        prec = (tp + eps) / (tp + fp + eps)
+        rec  = (tp + eps) / (tp + fn + eps)
+        out = {}
+        for i, name in enumerate(self.names):
+            out[f"dice/{name}"] = dice[i].item()
+            out[f"iou/{name}"] = iou[i].item()
+            out[f"precision/{name}"] = prec[i].item()
+            out[f"recall/{name}"] = rec[i].item()
+        out["dice/mean"] = dice.mean().item()
+        out["iou/mean"] = iou.mean().item()
+        out["precision/mean"] = prec.mean().item()
+        out["recall/mean"] = rec.mean().item()
+        return out
+
+
+def enable_dropout(model):
+    for m in model.modules():
+        if isinstance(m, (nn.Dropout, nn.Dropout2d, nn.Dropout3d)):
+            m.train()
+
+
+def mc_predict(model, x, T=MC_SAMPLES):
+    with torch.no_grad():
+        model.eval(); enable_dropout(model)
+        probs = torch.cat([torch.sigmoid(model(x)).unsqueeze(0) for _ in range(T)], dim=0)
+        mean = probs.mean(0); var = probs.var(0)
+        p = mean.clamp(1e-6, 1 - 1e-6)
+        entropy = -(p * p.log() + (1 - p) * (1 - p).log())
+        return mean, var, entropy
+
+
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model; self.acts = None; self.grads = None
+        target_layer.register_forward_hook(lambda m, i, o: setattr(self, "acts", o.detach()))
+        target_layer.register_full_backward_hook(lambda m, gi, go: setattr(self, "grads", go[0].detach()))
+    def __call__(self, x, region_idx=2):
+        self.model.eval(); self.model.zero_grad()
+        logits = self.model(x)
+        logits[:, region_idx].mean().backward()
+        w = self.grads.mean(dim=(2, 3), keepdim=True)
+        cam = F.relu((w * self.acts).sum(dim=1, keepdim=True))
+        cam = F.interpolate(cam, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        cam = cam.squeeze().cpu().numpy()
+        cam -= cam.min(); cam /= (cam.max() + 1e-8)
+        return cam
+
+
+def predict_tta(model, x):
+    with torch.no_grad():
+        model.eval()
+        preds = [torch.sigmoid(model(x))]
+        preds.append(torch.sigmoid(model(torch.flip(x, dims=[-1]))).flip(dims=[-1]))
+        preds.append(torch.sigmoid(model(torch.flip(x, dims=[-2]))).flip(dims=[-2]))
+        return torch.stack(preds, 0).mean(0)
+
+
+def remove_small_components(mask_np, min_size=MIN_COMPONENT_SIZE):
+    labeled, n = ndimage.label(mask_np)
+    if n == 0:
+        return mask_np
+    sizes = ndimage.sum(mask_np, labeled, range(1, n + 1))
+    keep = np.zeros_like(mask_np)
+    for i, s in enumerate(sizes, start=1):
+        if s >= min_size:
+            keep[labeled == i] = 1
+    return keep
+
+
+def postprocess_batch(pred_bchw):
+    arr = pred_bchw.cpu().numpy()
+    out = np.zeros_like(arr)
+    for b in range(arr.shape[0]):
+        for c in range(arr.shape[1]):
+            out[b, c] = remove_small_components(arr[b, c])
+    return torch.from_numpy(out).to(pred_bchw.device).float()
+
+
+def find_best_thresholds(model, val_ds, thr_grid=None):
+    if thr_grid is None:
+        thr_grid = np.arange(0.3, 0.71, 0.05)
+    with torch.no_grad():
+        model.eval()
+        dl = _loader(val_ds, False)
+        all_probs, all_targets = [], []
+        for x, y in tqdm(dl, desc="collecting val probs", leave=False):
+            x = x.to(DEVICE)
+            p = torch.sigmoid(model(x)).cpu()
+            all_probs.append(p); all_targets.append(y)
+        probs = torch.cat(all_probs, 0)
+        targets = torch.cat(all_targets, 0)
+
+        best_thr = []
+        for c in range(probs.shape[1]):
+            best_dice, best_t = -1, 0.5
+            for t in thr_grid:
+                pred = (probs[:, c] > t).float()
+                tp = (pred * targets[:, c]).sum()
+                fp = (pred * (1 - targets[:, c])).sum()
+                fn = ((1 - pred) * targets[:, c]).sum()
+                dice = (2 * tp + 1e-6) / (2 * tp + fp + fn + 1e-6)
+                if dice > best_dice:
+                    best_dice, best_t = dice.item(), float(t)
+            best_thr.append(best_t)
+            print(f"  region {REGIONS[c]}: best threshold {best_t:.2f} (val Dice {best_dice:.4f})")
+        return best_thr
+
+
+def _loader(ds, shuffle):
+    return DataLoader(ds, batch_size=BATCH_SIZE, shuffle=shuffle, num_workers=WORKERS, pin_memory=(DEVICE == "cuda"), drop_last=shuffle, persistent_workers=(WORKERS > 0))
+
+
+def run_epoch(model, dl, criterion, optimizer=None, scaler=None):
+    train = optimizer is not None
+    model.train() if train else model.eval()
+    acc = MetricAccumulator(REGIONS); total = 0.0
+    for x, y in tqdm(dl, leave=False):
+        x, y = x.to(DEVICE), y.to(DEVICE)
+        with torch.set_grad_enabled(train):
+            with autocast_ctx():
+                logits = model(x); loss = criterion(logits, y)
+            if train:
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer); scaler.update()
+        total += loss.item(); acc.update(logits.float(), y)
+    m = acc.compute(); m["loss"] = total / max(len(dl), 1)
+    return m
+
+
+def train():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    tr_ds, va_ds, te_ds = build_datasets()
+    print(f"train slices: {len(tr_ds)} | val: {len(va_ds)} | test: {len(te_ds)}")
+    dl_tr, dl_va = _loader(tr_ds, True), _loader(va_ds, False)
+
+    model = CASFNet().to(DEVICE)
+    criterion = DiceFocalLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, EPOCHS)
+    scaler = make_scaler()
+
+    best, history = -1.0, []
+    for ep in range(1, EPOCHS + 1):
+        tr = run_epoch(model, dl_tr, criterion, optimizer, scaler)
+        va = run_epoch(model, dl_va, criterion)
+        scheduler.step()
+        print(f"[{ep:03d}/{EPOCHS}] train loss {tr['loss']:.3f} dice {tr['dice/mean']:.3f} | val dice {va['dice/mean']:.3f} (WT {va['dice/WT']:.3f} TC {va['dice/TC']:.3f} ET {va['dice/ET']:.3f})")
+        history.append({"epoch": ep, "train": tr, "val": va})
+        if va["dice/mean"] > best:
+            best = va["dice/mean"]
+            torch.save(model.state_dict(), os.path.join(OUT_DIR, "best_model.pt"))
+            print(f"   -> saved best (mean val Dice {best:.4f})")
+    json.dump(history, open(os.path.join(OUT_DIR, "history.json"), "w"), indent=2)
+    print("done. best mean val Dice:", round(best, 4))
+    return model
+
+
+def _load_best():
+    model = CASFNet().to(DEVICE)
+    ckpt = os.path.join(OUT_DIR, "best_model.pt")
+    model.load_state_dict(torch.load(ckpt, map_location=DEVICE, weights_only=True))
+    return model
+
+
+def evaluate(use_tta=True, use_postprocess=True, thresholds=None):
+    with torch.no_grad():
+        _, va_ds, te_ds = build_datasets()
+        model = _load_best(); model.eval()
+
+        if thresholds is None:
+            print("Tuning per-region thresholds on validation set...")
+            thresholds = find_best_thresholds(model, va_ds)
+        print("Using thresholds:", dict(zip(REGIONS, thresholds)))
+
+        acc = MetricAccumulator(REGIONS)
+        dl = _loader(te_ds, False)
+        for x, y in tqdm(dl, leave=False):
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            probs = predict_tta(model, x) if use_tta else torch.sigmoid(model(x))
+            pred = torch.stack([(probs[:, c] > thresholds[c]).float() for c in range(probs.shape[1])], dim=1)
+            if use_postprocess:
+                pred = postprocess_batch(pred)
+            acc.tp += (pred * y).sum((0, 2, 3)).cpu()
+            acc.fp += (pred * (1 - y)).sum((0, 2, 3)).cpu()
+            acc.fn += ((1 - pred) * y).sum((0, 2, 3)).cpu()
+
+        res = acc.compute()
+        print("\n==== Test metrics (TTA + tuned thresholds + post-processing) ====")
+        for k in ["dice", "iou", "precision", "recall"]:
+            row = "  ".join(f"{r}:{res[f'{k}/{r}']:.3f}" for r in REGIONS)
+            print(f"{k:>9} | {row} | mean {res[f'{k}/mean']:.3f}")
+        res["thresholds"] = dict(zip(REGIONS, thresholds))
+        json.dump(res, open(os.path.join(OUT_DIR, "test_metrics.json"), "w"), indent=2)
+        return res, thresholds
+
+
+def visualize(model=None, n=4):
+    import matplotlib.pyplot as plt
+    _, _, te_ds = build_datasets()
+    if model is None:
+        model = _load_best()
+    fig_dir = os.path.join(OUT_DIR, "figures"); os.makedirs(fig_dir, exist_ok=True)
+    cam = GradCAM(model, model.u1.conv.net[0])
+    idxs = np.linspace(0, len(te_ds) - 1, n).astype(int)
+    for j, i in enumerate(idxs):
+        x, y = te_ds[i]; x = x.unsqueeze(0).to(DEVICE)
+        mean, var, ent = mc_predict(model, x, T=MC_SAMPLES)
+        pred = (mean > 0.5).float()
+        flair = x[0, 0].cpu().numpy(); flair = (flair - flair.min()) / (np.ptp(flair) + 1e-8)
+        heat = cam(x, region_idx=2)
+        fig, ax = plt.subplots(1, 5, figsize=(16, 3.4))
+        for a in ax: a.axis("off")
+        ax[0].imshow(flair, cmap="gray"); ax[0].set_title("FLAIR")
+        ax[1].imshow(y[2].numpy(), cmap="magma"); ax[1].set_title("GT (ET)")
+        ax[2].imshow(pred[0, 2].cpu().numpy(), cmap="magma"); ax[2].set_title("Prediction (ET)")
+        ax[3].imshow(ent[0, 2].cpu().numpy(), cmap="hot"); ax[3].set_title("MC-Dropout uncertainty")
+        ax[4].imshow(flair, cmap="gray"); ax[4].imshow(heat, cmap="jet", alpha=0.5)
+        ax[4].set_title("Grad-CAM (ET)")
+        plt.tight_layout()
+        out = os.path.join(fig_dir, f"case_{j}.png")
+        plt.savefig(out, dpi=140, bbox_inches="tight"); plt.close()
+        print("saved", out)
+
+
+def evaluate_baseline_vs_uncertainty(test_ds):
+    with torch.no_grad():
+        model = _load_best(); model.eval()
+        acc_baseline = MetricAccumulator(REGIONS)
+        acc_mc = MetricAccumulator(REGIONS)
+        dl = _loader(test_ds, False)
+        for x, y in tqdm(dl, leave=False):
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            logits_std = model(x)
+            acc_baseline.update(logits_std, y)
+            mean_prob, _, _ = mc_predict(model, x, T=MC_SAMPLES)
+            acc_mc.update(mean_prob, y, is_prob=True)
+        print("\n== Baseline (dropout off) ==")
+        r1 = acc_baseline.compute()
+        for k in ["dice","iou","precision","recall"]:
+            print(k, {n: round(r1[f"{k}/{n}"],3) for n in REGIONS}, "mean", round(r1[f"{k}/mean"],3))
+        print("\n== MC-Dropout mean prediction ==")
+        r2 = acc_mc.compute()
+        for k in ["dice","iou","precision","recall"]:
+            print(k, {n: round(r2[f"{k}/{n}"],3) for n in REGIONS}, "mean", round(r2[f"{k}/mean"],3))
+        json.dump({"baseline": r1, "mc_dropout": r2}, open(os.path.join(OUT_DIR, "baseline_vs_mc.json"), "w"), indent=2)
+        return r1, r2
+
+
+def uncertainty_error_correlation(test_ds, n_samples=200):
+    with torch.no_grad():
+        model = _load_best(); model.eval()
+        correct_unc, wrong_unc = [], []
+        n = min(n_samples, len(test_ds))
+        idxs = np.random.choice(len(test_ds), size=n, replace=False)
+        for i in tqdm(idxs):
+            x, y = test_ds[i]
+            x = x.unsqueeze(0).to(DEVICE)
+            mean_prob, _, entropy = mc_predict(model, x, T=MC_SAMPLES)
+            pred = (mean_prob > 0.5).float().cpu()[0]
+            gt = y
+            ent = entropy.cpu()[0]
+            is_correct = (pred == gt)
+            correct_unc.append(ent[is_correct].numpy())
+            wrong_unc.append(ent[~is_correct].numpy())
+        correct_unc = np.concatenate(correct_unc)
+        wrong_unc = np.concatenate(wrong_unc)
+        result = {
+            "mean_uncertainty_correct": float(correct_unc.mean()),
+            "mean_uncertainty_incorrect": float(wrong_unc.mean()),
+            "ratio_incorrect_over_correct": float(wrong_unc.mean() / (correct_unc.mean() + 1e-8)),
+            "n_slices_sampled": int(n),
+        }
+        print(f"\n== Uncertainty vs error (sampled {n} test slices) ==")
+        print(f"Mean uncertainty CORRECT: {result['mean_uncertainty_correct']:.4f}")
+        print(f"Mean uncertainty INCORRECT: {result['mean_uncertainty_incorrect']:.4f}")
+        print(f"Ratio: {result['ratio_incorrect_over_correct']:.2f}x")
+        json.dump(result, open(os.path.join(OUT_DIR, "uncertainty_error_correlation.json"), "w"), indent=2)
+        return result
+
+
+if __name__ == "__main__":
+    _m = CASFNet()
+    _y = _m(torch.randn(2, IN_CH, IMG_SIZE, IMG_SIZE))
+    print("model OK, output:", tuple(_y.shape), "| params: %.2fM" % (sum(p.numel() for p in _m.parameters()) / 1e6))
+    del _m, _y
+
+    train()
+    res, thr = evaluate(use_tta=True, use_postprocess=True)
+    visualize()
+
+    _, _, te_ds = build_datasets()
+    evaluate_baseline_vs_uncertainty(te_ds)
+    uncertainty_error_correlation(te_ds, n_samples=200)
+
+    print("\nALL DONE. Results saved in:", OUT_DIR)
+python casfnet_ready.py
