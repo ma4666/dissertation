@@ -1,0 +1,87 @@
+ Trustworthy Brain Tumour Segmentation (CASF-Net + MC-Dropout + Grad-CAM)
+
+This is the code for my MSc dissertation at Oxford Brookes University (COMP7039).
+
+The idea behind the project: segmentation models for brain tumours are already pretty accurate, but they don't tell you when they might be wrong. A mask that is 95% right and a mask that is badly off look exactly the same to whoever is reviewing it. I wanted to see if I could take a strong existing model and make it report its own uncertainty and show what it was looking at, without losing accuracy in the process.
+
+ What I did
+
+I used CASF-Net (Zheng et al., 2022) as the base model. It runs a CNN branch and a Transformer branch in parallel and combines them with cross-attention, so it gets both fine local detail and wider context. On top of that I added two things:
+
+- **Monte-Carlo Dropout** for uncertainty. Dropout stays switched on at test time, and I run each slice through the model 10 times. The average is the prediction, and how much the 10 runs disagree (entropy) becomes the uncertainty map.
+- **Grad-CAM** for explainability. It gives a heatmap of which parts of the scan pushed the enhancing tumour prediction.
+
+I trained and tested everything on 100 patients from BraTS-2021, split 70/15/15 by patient, so slices from the same brain never end up in both training and testing.
+
+Results
+
+Test set, with tuned thresholds, test-time augmentation and small-component removal:
+
+| Region | Dice | IoU | Precision | Recall |
+|---|---|---|---|---|
+| Whole tumour | 0.934 | 0.876 | 0.945 | 0.923 |
+| Tumour core | 0.895 | 0.810 | 0.930 | 0.863 |
+| Enhancing tumour | 0.897 | 0.813 | 0.874 | 0.922 |
+| Mean | 0.909 | 0.833 | 0.916 | 0.902 |
+
+The two results I actually care most about:
+
+1. **Turning on MC-Dropout didn't hurt accuracy.** Mean Dice went from 0.906 (dropout off) to 0.913 (MC-Dropout). I expected a small drop, so this was a nice surprise.
+2. **The uncertainty is meaningful.** On 200 random test slices, average uncertainty was 0.0085 on pixels the model got right and 0.3461 on pixels it got wrong. That's about 40.7 times higher on the mistakes. I added this check because a heatmap that "looks reasonable" doesn't prove anything on its own.
+
+## Running it
+
+I used Python 3.10 with PyTorch 2.5.1 and CUDA 12.1, on a Windows laptop with a 4GB GPU.
+
+```
+py -3.10 -m venv venv
+venv\Scripts\activate
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -r requirements.txt
+```
+
+The dataset isn't in this repo (it's 12.5GB and has its own license). I downloaded it through the Kaggle API:
+
+```
+kaggle datasets download -d dschettler8845/brats-2021-task1 -f BraTS2021_Training_Data.tar
+python extract_data.py
+```
+
+`extract_data.py` pulls out the first 100 subjects into `./BraTS2021`. Then:
+
+```
+python casfnet_ready.py
+```
+
+This trains for 15 epochs, tunes the thresholds on the validation set, evaluates on the test set, saves example figures, and runs the baseline comparison and the uncertainty check. Everything ends up in `runs/casfnet_brats_100/`.
+
+ Problems I ran into
+
+Getting this running locally took longer than training it. In case it helps anyone:
+
+- **Training was painfully slow at first** (about 48 seconds per batch). The cause was that my project folder was inside OneDrive, and the sync was fighting the data loader for disk access. Moving it to a normal local folder fixed it completely.
+- **cuDNN error with mixed precision.** AMP gave me an "unable to find an engine" error on my GPU, so `USE_AMP` is set to `False`.
+- **MemoryError with DataLoader workers on Windows.** On Windows each worker process keeps its own copy of the data cache, so RAM filled up fast. If this happens, set `WORKERS = 0` and lower `CACHE_SIZE`.
+- **CUDA out of memory.** With only 4GB, I had to keep images at 96x96. If you get OOM errors, drop `BATCH_SIZE` from 16 to 8.
+
+ Limitations
+
+- Only 100 of the 1,251 patients, so treat this as a pilot, not a benchmark
+- One training run with one seed, so I can't say how much the numbers would vary between runs
+- 2D slices only, no 3D context between neighbouring slices
+- No radiologist has reviewed the outputs, so I can't claim they're clinically useful yet
+
+ What I'd do next
+
+Run several seeds first to check the results hold up, then get a radiologist to look at the uncertainty maps. After that, scale to the full dataset and try a 3D version.
+
+ Main references
+
+- Zheng et al. (2022), CASF-Net: Cross-attention and cross-scale fusion network for medical image segmentation
+- Gal and Ghahramani (2016), Dropout as a Bayesian Approximation
+- Selvaraju et al. (2017), Grad-CAM
+- Baid et al. (2021), The RSNA-ASNR-MICCAI BraTS 2021 Benchmark
+
+---
+
+[Your Full Name], MSc Dissertation, Oxford Brookes University. Supervisor: [Supervisor Name]
